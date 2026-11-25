@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Centralized IRSA | AWS Examples</title><link rel="stylesheet" href="../../assets/style.css"></head><body><header><a href="../../index.html">AWS Examples</a><span>IAM / Crossplane</span></header><div class="layout"><nav><strong>ON THIS PAGE</strong><a href="#architecture">Architecture</a><a href="#identity">How IRSA works</a><a href="#iam">IAM configuration</a><a href="#kubernetes">Kubernetes configuration</a><a href="#cutover">Authentication cutover</a><a href="#validate">Validation</a><a href="#rollback">Rollback</a><a href="#security">Production controls</a><a href="#references">References</a></nav><main><p class="eyebrow">EKS · IAM · CROSSPLANE</p><h1>Centralized IRSA across AWS accounts</h1><p class="lead">Replace long-lived access keys with temporary credentials for centrally hosted Crossplane providers. One control plane can manage messaging infrastructure across multiple AWS accounts.</p><p class="note">Illustrative implementation using example account IDs. Assumes Crossplane v2 namespaced AWS managed resources and an Upbound AWS provider that supports IRSA and assumeRoleChain. Verify the installed schemas before applying.</p>
+<h2 id="architecture">1. Architecture</h2><div class="diagram"><div class="node">Central EKS cluster<br><small>SQS provider + SNS provider</small></div><div class="arrow">↓ shared DeploymentRuntimeConfig</div><div class="node">Kubernetes ServiceAccount<br><small>crossplane-aws · annotated with IAM role ARN</small></div><div class="arrow">↓ signed token → STS AssumeRoleWithWebIdentity</div><div class="node">Source IAM role · 111111111111<br><small>crossplane-provider-aws</small></div><div class="arrow">↓ STS AssumeRole · selected by ClusterProviderConfig</div><div class="branches"><div class="node">Dev · 222222222222<br><small>Messaging IAM role → SQS/SNS</small></div><div class="node">QA · 333333333333<br><small>Messaging IAM role → SQS/SNS</small></div></div></div><h3>Why this is powerful</h3><p>Only the cluster running the providers needs IRSA for this provisioning flow. Target accounts need IAM roles, not another Crossplane installation or OIDC provider. Application pods in target clusters may still need their own identity for sending or consuming messages.</p><div class="branches"><div class="panel"><h3>Before</h3>Provider → Kubernetes Secret → IAM user → target role → AWS API</div><div class="panel"><h3>After</h3>Provider → ServiceAccount token → source role → target role → AWS API</div></div>
+<h2 id="identity">2. How IRSA works</h2><p>The EKS control plane signs a short-lived ServiceAccount token. The OIDC issuer publishes public keys that AWS can use to verify the signature. The IAM OIDC provider establishes which issuer AWS trusts. The trust policy limits which ServiceAccount may assume the role. A permission policy determines what the assumed role may do.</p><ol><li>The IRSA webhook injects the role ARN and projected token path into a new pod using the annotated ServiceAccount.</li><li>The AWS SDK exchanges the token through STS AssumeRoleWithWebIdentity.</li><li>STS validates issuer, signature, expiration, audience and role trust, then returns temporary credentials.</li><li>The provider uses those credentials to call STS AssumeRole for the target environment role.</li><li>The provider uses the target role session for SQS/SNS API calls. The SDK refreshes credentials as required.</li></ol>
+<h2 id="iam">3. Configure AWS IAM</h2><h3>Step 1 — Verify the source OIDC provider</h3><pre><code>aws eks describe-cluster --name central-eks --region us-west-2 \
+  --query 'cluster.identity.oidc.issuer' --output text
+aws iam list-open-id-connect-providers</code></pre><p>Confirm the issuer matches a registered IAM OIDC provider in the source account, with sts.amazonaws.com as an allowed client ID. If missing, associate it using the official EKS instructions.</p><h3>Step 2 — Create the source role</h3><p>Create <code>crossplane-provider-aws</code> in account 111111111111. Replace EXAMPLEOIDC with the actual issuer ID. The trust policy grants only the specified namespace and ServiceAccount access.</p><pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::111111111111:oidc-provider/oidc.eks.us-west-2.amazonaws.com/id/EXAMPLEOIDC"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "oidc.eks.us-west-2.amazonaws.com/id/EXAMPLEOIDC:aud": "sts.amazonaws.com",
+        "oidc.eks.us-west-2.amazonaws.com/id/EXAMPLEOIDC:sub": "system:serviceaccount:crossplane-system:crossplane-aws"
+      }
+    }
+  }]
+}</code></pre><p>Attach the following permission policy. Start with Dev only; add QA and other approved roles after validation. Do not grant wildcard AssumeRole access.</p><pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": "sts:AssumeRole",
+    "Resource": [
+      "arn:aws:iam::222222222222:role/crossplane-messaging"
+    ]
+  }]
+}</code></pre><h3>Step 3 — Configure the target role</h3><p>In the Dev account, create or update a dedicated least-privilege messaging role. Add this statement to its existing trust policy; preserve existing authorized consumers during migration.</p><pre><code>{
+  "Effect": "Allow",
+  "Principal": {
+    "AWS": "arn:aws:iam::111111111111:role/crossplane-provider-aws"
+  },
+  "Action": "sts:AssumeRole"
+}</code></pre><p>The target role's permissions must cover the actual SQS/SNS resources and lifecycle actions required by the Composition, including tagging, queue policies and subscriptions. Scope resources and actions as tightly as supported. The source permission and target trust must both allow role assumption.</p>
+<h2 id="kubernetes">4. Configure Crossplane</h2><h3>Step 4 — Create one externally managed ServiceAccount</h3><pre><code>apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: crossplane-aws
+  namespace: crossplane-system
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::111111111111:role/crossplane-provider-aws</code></pre><h3>Step 5 — Share an existing ServiceAccount via runtime config</h3><pre><code>apiVersion: pkg.crossplane.io/v1beta1
+kind: DeploymentRuntimeConfig
+metadata:
+  name: aws-irsa
+spec:
+  deploymentTemplate:
+    spec:
+      replicas: 1
+      selector: {}
+      template:
+        spec:
+          serviceAccountName: crossplane-aws</code></pre><p>Use deploymentTemplate to reference the existing ServiceAccount. Do not set the same serviceAccountTemplate.metadata.name on multiple packages: ownership conflicts can occur. Preserve existing scheduling, scaling and resource settings. Shared ServiceAccounts combine Kubernetes permissions; separate identities are preferable when isolation matters.</p><h3>Step 6 — Update provider references</h3><pre><code>apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-aws-sqs
+spec:
+  package: xpkg.upbound.io/upbound/provider-aws-sqs:v2.9.0
+  runtimeConfigRef:
+    name: aws-irsa
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-aws-sns
+spec:
+  package: xpkg.upbound.io/upbound/provider-aws-sns:v2.9.0
+  runtimeConfigRef:
+    name: aws-irsa</code></pre><p>Apply the ServiceAccount and runtime config first. Keep the installed provider package versions unchanged; the versions here are illustrative. Let the provider pods roll out. Keep functions on a separate runtime config unless they explicitly need AWS access.</p>
+<h2 id="cutover">5. Switch the authentication source</h2><p>After verifying the pod identity, update the existing ClusterProviderConfig in place. Keep its name and target role unchanged.</p><div class="branches"><div><h3>Before</h3><pre><code>credentials:
+  source: Secret
+  secretRef:
+    namespace: crossplane-system
+    name: aws-creds
+    key: credentials</code></pre></div><div><h3>After</h3><pre><code>credentials:
+  source: IRSA</code></pre></div></div><pre><code>apiVersion: aws.m.upbound.io/v1beta1
+kind: ClusterProviderConfig
+metadata:
+  name: aws-dev
+spec:
+  credentials:
+    source: IRSA
+  assumeRoleChain:
+    - roleARN: arn:aws:iam::222222222222:role/crossplane-messaging</code></pre><p>A Queue or Topic managed resource continues to reference the same configuration:</p><pre><code>spec:
+  providerConfigRef:
+    name: aws-dev
+    kind: ClusterProviderConfig</code></pre><p>The Composition, XRD and XR remain unchanged when the reference and resource identities remain the same. For QA, create aws-qa with the QA role ARN and authorize that ARN in the source role. There is no need to install a provider for every account.</p>
+<h2 id="validate">6. Validate before and after cutover</h2><pre><code>kubectl get providers
+kubectl get pods -n crossplane-system
+kubectl get sa crossplane-aws -n crossplane-system -o yaml
+kubectl describe pod PROVIDER_POD -n crossplane-system
+kubectl explain clusterproviderconfig.spec.credentials --api-version=aws.m.upbound.io/v1beta1</code></pre><p>Confirm AWS_ROLE_ARN and AWS_WEB_IDENTITY_TOKEN_FILE are present. In an authorized short-lived test pod using the same ServiceAccount, run:</p><pre><code>aws sts get-caller-identity
+aws sts assume-role \
+  --role-arn arn:aws:iam::222222222222:role/crossplane-messaging \
+  --role-session-name irsa-test \
+  --query AssumedRoleUser.Arn --output text</code></pre><p>The first call must identify the source role; the second must return the target role ARN. Remove the test pod immediately. Verify fresh provider reconciliation, managed resource conditions and CloudTrail STS events, rather than relying on an old Ready=True condition.</p><pre><code>kubectl get managed -A
+kubectl logs -n crossplane-system PROVIDER_POD --since=10m</code></pre>
+<h2 id="rollback">7. Rollback and cleanup</h2><p>Use two GitOps changes: first enable IRSA on provider pods, then change the Dev ClusterProviderConfig. Keep the old Secret until the migration is proven. If authentication fails, revert the existing ProviderConfig to source: Secret and restore its secretRef, then sync and verify reconciliation. Do not delete providers, XRs or managed resources to switch credentials. Avoid Argo CD Force/Replace during this migration.</p><p>Only remove the Secret and deactivate old IAM user credentials after checking all consumers, including Terraform and other pipelines. Existing AWS resources should remain intact if the target account, region and external identities are unchanged.</p>
+<h2 id="security">8. Production controls</h2><ul><li>Use least-privilege target roles; avoid administrator roles and wildcard role assumption.</li><li>Separate production and non-production identities or control planes where required. Shared ServiceAccounts do not isolate provider privileges.</li><li>Restrict who can create pods with privileged ServiceAccounts and who can change ProviderConfigs or environment inputs.</li><li>Ensure network access to STS and required AWS APIs; restrict node metadata access.</li><li>Keep IAM configuration in reviewed infrastructure-as-code and monitor CloudTrail and reconciliation failures.</li></ul><h2 id="references">Official references</h2><ul><li><a href="https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html">AWS: IAM roles for service accounts</a></li><li><a href="https://docs.aws.amazon.com/eks/latest/userguide/cross-account-access.html">AWS: Cross-account access with IRSA</a></li><li><a href="https://docs.aws.amazon.com/eks/latest/userguide/associate-service-account-role.html">AWS: Associate an IAM role with a ServiceAccount</a></li><li><a href="https://docs.crossplane.io/v2.4/packages/providers/">Crossplane: Providers and runtime configuration</a></li><li><a href="https://docs.upbound.io/manuals/packages/providers/authentication/">Upbound: Provider authentication</a></li></ul><footer>Illustrative guide · Validate against your installed versions and security policies.</footer></main></div><script src="../../assets/copy.js"></script></body></html>
