@@ -1,0 +1,7 @@
+aws_region = "us-west-2"
+cluster_name = "example-dev-cluster"
+enable_auth_endpoint = false
+# To enable private EKS Auth endpoint:
+# vpc_id = "vpc-xxxx"
+# endpoint_subnet_ids = ["subnet-xxxx", "subnet-yyyy"]
+# endpoint_security_group_ids = ["sg-xxxx"]
