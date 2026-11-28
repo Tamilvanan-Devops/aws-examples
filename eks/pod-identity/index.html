@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>EKS Pod Identity | AWS Examples</title><link rel="stylesheet" href="../../assets/style.css"><style>.three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.three .node{font-size:13px}.safe{border-left:3px solid #6da9e1;padding:14px;background:var(--panel)}table{border-collapse:collapse;width:100%}td,th{border:1px solid var(--line);padding:10px;text-align:left;vertical-align:top}summary{cursor:pointer;font-weight:700}details{border:1px solid var(--line);padding:12px;margin:12px 0;border-radius:8px}@media(max-width:760px){.three{grid-template-columns:1fr}}</style></head>
+<body><header><a href="../../index.html">AWS Examples</a><span>EKS / Pod Identity</span></header><div class="layout"><nav><strong>CONTENTS</strong><a href="#overview">Overview</a><a href="#architecture">Architecture</a><a href="#roles">The four components</a><a href="#agent">1. Install agent</a><a href="#iam">2. Create IAM role</a><a href="#sa">3. Service account</a><a href="#association">4. Association</a><a href="#deploy">5. Deploy application</a><a href="#terraform">Terraform</a><a href="#developer">.NET developer changes</a><a href="#runtime">Credentials flow</a><a href="#test">Validation</a><a href="#security">Security</a><a href="#migrate">Migration and rollback</a><a href="#references">AWS docs</a></nav>
+<main><p class="eyebrow">EKS · IAM · TEMPORARY AWS CREDENTIALS</p><h1>Amazon EKS Pod Identity</h1><p class="lead">Understand how pods access S3, SQS, SNS and other AWS services without storing long-lived IAM user credentials. A step-by-step guide for DevOps and application developers.</p><p class="note"><strong>Scope:</strong> AWS EKS application workloads. The existing <a href="../../crossplane/irsa/index.html">Crossplane/IRSA guide</a> is separate. All example account IDs, ARNs and images are illustrative. The repository does not run Terraform automatically.</p>
+<h2 id="overview">1. Before vs after</h2><div class="branches"><div class="panel"><h3>Before: IAM user credentials</h3><div class="diagram"><div class="node">IAM user</div><div class="arrow">↓ Permanent access key + secret</div><div class="node">Doppler / Kubernetes Secret</div><div class="arrow">↓</div><div class="node">Application pod → AWS API</div></div></div><div class="panel"><h3>After: Pod Identity</h3><div class="diagram"><div class="node">Service account</div><div class="arrow">↓ EKS association</div><div class="node">Application IAM role</div><div class="arrow">↓ Agent provides temporary credentials</div><div class="node">Application pod → AWS API</div></div></div></div>
+<h2 id="architecture">2. Architecture for many applications</h2><p><strong>Install the Pod Identity Agent once per eligible EKS cluster.</strong> Applications share the cluster agent but should have separate, least-privilege application identities. An application that does not need AWS APIs needs no Pod Identity role.</p>
+<div class="diagram"><div class="node">EKS cluster on EC2 nodes<br><small>Pod Identity Agent DaemonSet</small></div><div class="arrow">↓ Dedicated Kubernetes service accounts</div><div class="three"><div class="node">Orders API<br><small>orders/orders-api</small></div><div class="node">Search API<br><small>search/search-api</small></div><div class="node">Notify API<br><small>notify/notify-api</small></div></div><div class="arrow">↓ Pod Identity associations</div><div class="three"><div class="node">Orders IAM role<br><small>S3 read-only</small></div><div class="node">Search IAM role<br><small>SQS receive</small></div><div class="node">Notify IAM role<br><small>SNS publish</small></div></div><div class="arrow">↓ AWS SDK signs calls with temporary role credentials</div><div class="three"><div class="node">S3 bucket</div><div class="node">SQS queue</div><div class="node">SNS topic</div></div></div>
+<h2 id="roles">3. Understand the four components</h2><table><tr><th>Identity</th><th>Purpose</th></tr><tr><td>EC2 worker node IAM role</td><td>Authorizes the agent to call EKS Auth using <code>eks-auth:AssumeRoleForPodIdentity</code>. It should not hold broad application S3/SQS permissions.</td></tr><tr><td>Kubernetes service account</td><td>Identifies the pod, e.g. <code>orders/orders-api</code>.</td></tr><tr><td>Application IAM role</td><td>Specifies exactly which AWS actions/resources the application may access.</td></tr><tr><td>Pod Identity association</td><td>Maps cluster + namespace + service account to the application IAM role in EKS.</td></tr></table><p class="safe"><strong>Why does the agent need the node role?</strong> The agent authenticates to the EKS Auth API with node credentials, presents the pod token, and obtains temporary credentials for the app-specific IAM role. The node's EKS Auth permission alone does not grant S3/SQS access.</p>
+<h2 id="agent">Step 1 · Install Pod Identity Agent</h2><p>Prerequisites: supported EKS cluster, supported Linux EC2 nodes (not EKS Fargate), AWS CLI, kubectl and IAM permissions. In AWS Console: <b>EKS → Clusters → selected cluster → Add-ons → Get more add-ons → EKS Pod Identity Agent</b>. Do not recreate an existing add-on.</p><pre><code>export AWS_REGION=us-west-2
+export CLUSTER=example-dev-cluster
+aws eks describe-addon --cluster-name "$CLUSTER" --addon-name eks-pod-identity-agent --region "$AWS_REGION"
+# Only if not already installed:
+aws eks create-addon --cluster-name "$CLUSTER" --addon-name eks-pod-identity-agent --region "$AWS_REGION"
+kubectl -n kube-system get daemonset eks-pod-identity-agent</code></pre><p>Confirm the EC2 node role has <code>eks-auth:AssumeRoleForPodIdentity</code>; typically it is included in <code>AmazonEKSWorkerNodePolicy</code>. Private nodes need EKS Auth connectivity, often through interface endpoint <code>com.amazonaws.us-west-2.eks-auth</code>. Pods need to reach agent endpoint <code>169.254.170.23:80</code>. See <a href="agent/main.tf">Terraform agent setup</a> and <a href="agent/terraform.tfvars.example">variables</a>.</p>
+<h2 id="iam">Step 2 · Create an application IAM role</h2><p>Example <code>orders-api-pod-role</code> in the EKS cluster's AWS account. IAM Console → Roles → Create role → Custom trust policy. Trust permits the EKS Pod Identity service; use request-tag conditions to restrict to the expected cluster, namespace and service account. Keep EKS Pod Identity session tags enabled.</p><pre><code>{
+ "Version":"2012-10-17",
+ "Statement":[{
+  "Effect":"Allow",
+  "Principal":{"Service":"pods.eks.amazonaws.com"},
+  "Action":["sts:AssumeRole","sts:TagSession"],
+  "Condition":{"StringEquals":{
+   "aws:RequestTag/eks-cluster-arn":"arn:aws:eks:us-west-2:111122223333:cluster/example-dev-cluster",
+   "aws:RequestTag/kubernetes-namespace":"orders",
+   "aws:RequestTag/kubernetes-service-account":"orders-api"
+  }}
+ }]
+}</code></pre><p>Attach a separate <strong>permissions policy</strong> for actual application AWS calls. Example: S3 object read only, not full S3 administrator access:</p><pre><code>{
+ "Version":"2012-10-17",
+ "Statement":[{
+  "Effect":"Allow","Action":"s3:GetObject",
+  "Resource":"arn:aws:s3:::example-orders-bucket/incoming/*"
+ }]
+}</code></pre><p>Trust answers <strong>who can assume</strong> the role; permissions answer <strong>what the role may do</strong>. For SQS or SNS, use exact actions and queue/topic ARNs required by the workload.</p>
+<h2 id="sa">Step 3 · Create the service account</h2><pre><code>apiVersion: v1
+kind: Namespace
+metadata:
+  name: orders
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orders-api
+  namespace: orders</code></pre><p>Apply <a href="kubernetes/serviceaccount.yaml">serviceaccount.yaml</a>. Unlike IRSA, Pod Identity needs no <code>eks.amazonaws.com/role-arn</code> annotation.</p>
+<h2 id="association">Step 4 · Create the EKS association</h2><p>AWS Console: EKS → your cluster → Access → Pod Identity associations → Create. Select namespace <code>orders</code>, service account <code>orders-api</code>, IAM role <code>orders-api-pod-role</code>.</p><pre><code>aws eks create-pod-identity-association  --cluster-name example-dev-cluster  --namespace orders  --service-account orders-api  --role-arn arn:aws:iam::111122223333:role/orders-api-pod-role  --region us-west-2
+aws eks list-pod-identity-associations --cluster-name example-dev-cluster --region us-west-2</code></pre><p>Manage this with Terraform in real environments. Restrict who may create/update/delete associations and call <code>iam:PassRole</code>.</p>
+<h2 id="deploy">Step 5 · Update Helm/Deployment</h2><pre><code>spec:
+  template:
+    spec:
+      serviceAccountName: orders-api
+      containers:
+      - name: orders-api
+        image: REPLACE_WITH_REAL_IMAGE
+        env:
+        - name: AWS_REGION
+          value: us-west-2
+        - name: AWS_EC2_METADATA_DISABLED
+          value: "true"</code></pre><p>Keep your application's existing container resources, ports, probes and security settings. See <a href="kubernetes/deployment-example.yaml">deployment example</a>. Existing pods should be restarted after association creation using <code>kubectl -n orders rollout restart deployment/orders-api</code>.</p>
+<h2 id="terraform">6. Terraform examples</h2><p><a href="agent/main.tf">Agent Terraform</a> installs the add-on and optionally creates EKS Auth endpoint. <a href="terraform/main.tf">Application Terraform</a> creates a restricted IAM role, AWS permission policy, and EKS association. See <a href="terraform/variables.tf">variables</a>, <a href="terraform/outputs.tf">outputs</a>, and <a href="terraform/terraform.tfvars.example">example inputs</a>.</p><pre><code>cd eks/pod-identity/terraform
+cp terraform.tfvars.example terraform.tfvars
+# Replace examples with approved values.
+terraform init
+terraform fmt -check
+terraform validate
+terraform plan
+# Apply only after review.</code></pre><p>For many workloads, make this a reusable versioned Terraform module, invoked per app/environment. Do not create duplicate resources if an add-on or association is already managed in another Terraform state.</p>
+<h2 id="developer">7. Developer-side .NET changes</h2><p>Use a compatible AWS SDK and its default credential chain. Old code that passes hardcoded or environment-provided keys must be replaced.</p><h3>Before</h3><pre><code>var credentials = new BasicAWSCredentials(accessKey, secretKey);
+var s3 = new AmazonS3Client(credentials, RegionEndpoint.USWest2);</code></pre><h3>After</h3><pre><code>var s3 = new AmazonS3Client(RegionEndpoint.USWest2);</code></pre><p>ASP.NET Core can use the usual dependency-injection registrations (<code>AddDefaultAWSOptions</code> and <code>AddAWSService&lt;IAmazonS3&gt;</code>). Verify <code>AWSSDK.Core</code> meets <a href="https://docs.aws.amazon.com/eks/latest/userguide/pod-id-minimum-sdk.html">AWS SDK minimum requirements</a>. After successful migration, remove legacy keys from code, appsettings, Kubernetes, Helm and Doppler. Keep non-secret bucket, queue and region settings.</p>
+<h2 id="runtime">8. What happens when an app accesses S3?</h2><div class="diagram"><div class="node">1. AWS SDK looks for credentials</div><div class="arrow">↓ injected container credential endpoint and projected token</div><div class="node">2. SDK contacts Pod Identity Agent<br><small>169.254.170.23:80</small></div><div class="arrow">↓ agent uses worker node IAM credentials and pod token</div><div class="node">3. EKS Auth validates association and gets app IAM credentials</div><div class="arrow">↓ temporary access key + secret + session token + expiry</div><div class="node">4. SDK signs AWS request and refreshes credentials as needed</div></div><p>Application code does not manually perform STS calls. A compromised pod could still misuse temporary credentials until they expire or are revoked/denied, so isolation matters.</p>
+<h2 id="test">9. Validate and troubleshoot</h2><pre><code>kubectl -n orders get sa orders-api
+kubectl -n orders get deploy orders-api -o jsonpath='{.spec.template.spec.serviceAccountName}'
+kubectl -n orders exec deploy/orders-api -- printenv | grep '^AWS_CONTAINER_'
+# Approved debug pod with the SAME service account and AWS CLI:
+aws sts get-caller-identity</code></pre><p>Expected assumed role: <code>orders-api-pod-role</code>. Verify a permitted S3 request succeeds; an unauthorized bucket or operation must return <code>AccessDenied</code>. Never print credential token contents. Use CloudTrail and application logs for additional validation.</p>
+<details><summary>No injected credentials variables?</summary>Check service account, namespace, EKS association, pod restart, compatible EKS version and agent health.</details>
+<details><summary>Credentials request times out?</summary>Check EKS Auth endpoint, agent local endpoint, node IAM policy, NetworkPolicies and proxy settings.</details>
+<details><summary>SDK uses the node role or static keys?</summary>Remove explicit credentials and profile settings, validate SDK default chain, and disable metadata fallback.</details>
+<h2 id="security">10. Production security checklist</h2><ul><li>Separate, least-privilege application IAM role per workload/environment.</li><li>Constrain role trust to cluster ARN, namespace and service-account tags.</li><li>Restrict <code>iam:PassRole</code> and EKS association lifecycle permissions.</li><li>Restrict Kubernetes service-account impersonation and pod creation using RBAC and admission policy.</li><li>Enforce IMDSv2; consider hop limit 1; reduce node role S3/SQS permissions after dependencies migrate.</li><li>Protect EKS Auth networking and Pod Identity Agent reachability.</li><li>Enable CloudTrail monitoring; define emergency session revocation/deny procedures.</li></ul>
+<h2 id="migrate">11. Migration and safe rollback</h2><ol><li>Inventory app AWS permissions, SDK versions and all old secret consumers. Revoke known-compromised keys immediately.</li><li>Install and verify agent in a non-production cluster.</li><li>Create pilot application's IAM role, SA and association.</li><li>Deploy app using SDK default credentials; test allowed and denied AWS calls and automatic refresh.</li><li>Remove obsolete access keys and IAM users once all consumers are cut over.</li><li>Roll out through environments using reviewed Terraform and GitOps.</li></ol><p><b>Rollback:</b> pause app rollout or revert to a last secure image, correct IAM/SDK/association issues and test again. Do not restore compromised long-lived credentials.</p>
+<h2 id="references">12. Official AWS documentation</h2><ul><li><a href="https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html">Pod Identity overview</a></li><li><a href="https://docs.aws.amazon.com/eks/latest/userguide/pod-id-agent-setup.html">Agent setup</a></li><li><a href="https://docs.aws.amazon.com/eks/latest/userguide/pod-id-role.html">IAM role trust</a></li><li><a href="https://docs.aws.amazon.com/eks/latest/userguide/pod-id-association.html">Association</a></li><li><a href="https://docs.aws.amazon.com/eks/latest/userguide/pod-id-how-it-works.html">Runtime flow</a></li><li><a href="https://docs.aws.amazon.com/eks/latest/best-practices/identity-and-access-management.html">Best practices</a></li></ul><footer>Independent educational guide. Use approved AWS credentials, IAM policies and review before production deployment.</footer>
+</main></div><script src="../../assets/copy.js"></script></body></html>

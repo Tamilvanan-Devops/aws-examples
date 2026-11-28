@@ -1,0 +1,13 @@
+aws_region = "us-west-2"
+cluster_name = "example-dev-cluster"
+cluster_arn = "arn:aws:eks:us-west-2:111122223333:cluster/example-dev-cluster"
+namespace = "orders"
+service_account_name = "orders-api"
+role_name = "orders-api-pod-role"
+policy_statements = [
+  {
+    sid = "ReadOrderObjects"
+    actions = ["s3:GetObject"]
+    resources = ["arn:aws:s3:::example-orders-bucket/incoming/*"]
+  }
+]

@@ -1,0 +1,25 @@
+# Example only: preserve existing ports, readiness checks, resource limits and settings.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-api
+  namespace: orders
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orders-api
+  template:
+    metadata:
+      labels:
+        app: orders-api
+    spec:
+      serviceAccountName: orders-api
+      containers:
+        - name: orders-api
+          image: REPLACE_WITH_REAL_IMAGE
+          env:
+            - name: AWS_REGION
+              value: us-west-2
+            - name: AWS_EC2_METADATA_DISABLED
+              value: "true"
